@@ -31,6 +31,7 @@ def FiPhoEpocAveraging(inputs):
     import matplotlib.pyplot as plt  # standard Python plotting library
     import scipy.stats as stats
     import tdt
+    import sys
     
     # Jupyter has a bug that requires import of matplotlib outside of cell with 
     # matplotlib inline magic to properly apply rcParams
@@ -71,6 +72,9 @@ def FiPhoEpocAveraging(inputs):
     # below -ARTIFACT level, remove it from the data set.
     total1 = np.size(data.streams[GCaMP].filtered)
     total2 = np.size(data.streams[ISOS].filtered)
+    if total1 == 0 or total2 == 0:
+        print('The t-range is too large and no data is returned. Try reducing this range.')
+        sys.exit()
     
     # List comprehension checking if any single array in 2D filtered array is > Artifact or < -Artifact
     data.streams[GCaMP].filtered = [x for x in data.streams[GCaMP].filtered 

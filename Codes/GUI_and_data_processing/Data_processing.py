@@ -204,24 +204,24 @@ def check_for_excluded_data(inputs, outputs):
         print('\nPLEASE NOTE: '+str(len(event_onsets)-len(outputs['zScore'])) + ' events '+
               'have been excluded, because their window durations go outside '+
               'the recording.\n')
-
+              
         # Create a list of epoch intervals for each event onset.
         event_intervals = []
-        for onset in event_onsets:
-            left_bound  = onset + inputs['t-range'][0]
-            right_bound = onset + (inputs['t-range'][1] + inputs['t-range'][0])
-            event_intervals += [(left_bound, right_bound)]
+        time_ranges = inputs['Tank'].time_ranges
+        for i in range(len(time_ranges[0])):
+            event_intervals += [time_ranges[0][i], time_ranges[1][i]]
             
         # Create an interval for the entire experiment duration.
-        start_time   = inputs['Tank'].streams[inputs['GCaMP']].start_time
-        exp_length   = inputs['Tank'].info.duration.total_seconds()
+        GCaMP        = inputs['Tank'].streams[inputs['GCaMP']]
+        start_time   = GCaMP.start_time
+        exp_length   = len(GCaMP.data) / GCaMP.fs
         exp_interval = (start_time, start_time + exp_length)
         
         # Find which event indices are excluded for extending beyond the recording
         # length.
-        nonexcluded_events = [i for i in range(len(event_intervals))
-                              if event_intervals[i][0] >= exp_interval[0] and
-                                 event_intervals[i][1] <= exp_interval[1]]
+        nonexcluded_events = [i for i in range(len(time_ranges[0]))
+                              if time_ranges[0][i] >= exp_interval[0] and
+                                 time_ranges[1][i] <= exp_interval[1]]
         
         # Change the inputs['Tank'].epocs['Analyse_this_event'] info to exclude 
         # these event indices.

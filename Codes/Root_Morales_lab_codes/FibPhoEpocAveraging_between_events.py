@@ -31,6 +31,7 @@ def FiPhoEpocAveraging_between_events(inputs):
     import matplotlib.pyplot as plt  # standard Python plotting library
     import scipy.stats as stats
     import tdt
+    import sys
     
     # Jupyter has a bug that requires import of matplotlib outside of cell with 
     # matplotlib inline magic to properly apply rcParams
@@ -70,6 +71,14 @@ def FiPhoEpocAveraging_between_events(inputs):
     # For stream events, the chunks of data are stored in cell arrays structured as `data.streams[GCaMP].filtered`
     data = tdt.epoc_filter(data_full, REF_EPOC, t=TRANGE, values=SHOCK_CODE)
     
+    # Optionally remove artifacts. If any waveform is above ARTIFACT level, or
+    # below -ARTIFACT level, remove it from the data set.
+    total1 = np.size(data.streams[GCaMP].filtered)
+    total2 = np.size(data.streams[ISOS].filtered)
+    if total1 == 0 or total2 == 0:
+        print('The t-range is too large and no data is returned. Try reducing this range.')
+        sys.exit()
+    
     # TRANGE is defined as [time before epoch onset, window duration starting from this time].
     # If only one value is given in TRANGE, the window duration is the time between TRANGE[0] and each epoch offset.
     # But the rest of the code relies on a value for the window duration for the time-axis range.
@@ -78,16 +87,16 @@ def FiPhoEpocAveraging_between_events(inputs):
     if len(TRANGE) == 1:
         start_times = data.time_ranges[0]
         end_times   = data.time_ranges[1]
+
+        # Find the end time of the recording.
+        exp_length    = len(data.streams[GCaMP].data) / data.streams[GCaMP].fs
+        recording_end = data.streams[GCaMP].start_time + exp_length
+        
         # If there is an infinity in end_times, make that the end of the recording.
-        recording_end = data.info.duration.total_seconds()
-        end_times = np.where(end_times==np.inf, recording_end, end_times) 
+        end_times = np.where(end_times==np.inf, recording_end, end_times)
+        
         # Find the largest window duration by subtracting end_times and start_times.
         TRANGE += [max(np.subtract(end_times, start_times))]
-    
-    # Optionally remove artifacts. If any waveform is above ARTIFACT level, or
-    # below -ARTIFACT level, remove it from the data set.
-    total1 = np.size(data.streams[GCaMP].filtered)
-    total2 = np.size(data.streams[ISOS].filtered)
     
     # List comprehension checking if any single array in 2D filtered array is > Artifact or < -Artifact
     data.streams[GCaMP].filtered = [x for x in data.streams[GCaMP].filtered 
