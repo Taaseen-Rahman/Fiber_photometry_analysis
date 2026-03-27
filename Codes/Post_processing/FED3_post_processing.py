@@ -272,7 +272,24 @@ def FED3_post_processing():
             mouse = str(row[mouse_id_col])
             sex = row[sex_col]
             
-            df = pd.read_excel(file, sheet_name=tab, header=None)
+            try:
+                df = pd.read_excel(file, sheet_name=tab, header=None)
+
+                custom_idx = df[df.eq("Custom name").any(axis=1)].index[0]
+                event_note_idx = df[df.eq("Event note").any(axis=1)].index[0]
+                max_idx = df[df.eq("Max values").any(axis=1)].index[0]
+
+                max_time_idx = df[df.astype(str).apply(
+                    lambda r: r.str.contains("Time of max", case=False).any(), axis=1
+                )].index[0]
+
+                baseline_idx = df[df.astype(str).apply(
+                    lambda r: r.str.contains("Time to baseline", case=False).any(), axis=1
+                )].index[0]
+
+            except Exception:
+                print(f"Skipping {tab} for {row['Filename']} (invalid structure)")
+                continue
 
             custom_idx = df[df.eq("Custom name").any(axis=1)].index[0]
             event_note_idx = df[df.eq("Event note").any(axis=1)].index[0]
@@ -358,6 +375,10 @@ def FED3_post_processing():
         # ------------------------------------------------------------
         # STACKED PER-MOUSE MEAN ± SEM PLOT
         # ------------------------------------------------------------
+        if len(combined_raw[tab]) == 0:
+            print(f"No data found for {tab}, skipping.")
+            continue
+        
         n_mice = len(combined_raw[tab])
 
         fig, axes = plt.subplots(n_mice, 1, figsize=(8, 2*n_mice), sharex=True)
@@ -1044,6 +1065,10 @@ def FED3_post_processing():
 
         for tab in selected_tabs:
 
+            if len(combined_raw[tab]) == 0:
+                print(f"Skipping export for {tab} (no data)")
+                continue
+
             # ------------------------------------------------------------
             # EVENTS
             # ------------------------------------------------------------
@@ -1538,4 +1563,3 @@ def FED3_post_processing():
 
 if __name__ == "__main__":
     FED3_post_processing()
-    
