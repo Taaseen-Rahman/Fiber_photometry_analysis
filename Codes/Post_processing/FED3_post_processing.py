@@ -401,7 +401,7 @@ def FED3_post_processing():
             )
 
             ax.axvline(0, linestyle="--")
-            ax.set_xlim(-20, 60)
+            ax.set_xlim(reference_time.min(), reference_time.max())
 
             ax.set_ylabel(mouse)
 
@@ -442,7 +442,7 @@ def FED3_post_processing():
             )
 
         plt.axvline(0, linestyle="--")
-        plt.xlim(-20, 60)
+        plt.xlim(reference_time.min(), reference_time.max())
         plt.xlabel("Time (s)")
         plt.ylabel("Z-score")
         plt.title(f"{tab} Events ({group_column} Overlay)")
