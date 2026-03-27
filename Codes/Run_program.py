@@ -6,6 +6,8 @@ from Analysis_types.Peri_events import *
 from Root_Morales_lab_codes.FibPhoEpocAveraging_between_events import *
 from Analysis_types.FED3 import *
 from Analysis_types.Between_events import *
+from Post_processing.FED3_post_processing import *
+from Post_processing.Peri_events_post_processing import *
 from tqdm import tqdm
 
 check_package_versions()
