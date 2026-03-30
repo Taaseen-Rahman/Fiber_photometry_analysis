@@ -154,6 +154,15 @@ def FED3_post_processing():
     # ------------------------------------------------------------
     # SORT METADATA
     # ------------------------------------------------------------
+    
+    if metadata_df is None:
+        messagebox.showerror(
+            "Metadata Error",
+            "Metadata was not created or loaded properly."
+        )
+        root.destroy()
+        return
+
     meta_columns = [col for col in metadata_df.columns if col != "Filename"]
 
     mouse_id_col = meta_columns[0]
@@ -185,7 +194,7 @@ def FED3_post_processing():
     selected_tabs = []
 
     def confirm_tabs():
-        global selected_tabs
+        nonlocal selected_tabs
         selected_tabs = [tab for tab, var in tab_vars.items() if var.get()]
         tab_window.destroy()
 
@@ -193,6 +202,14 @@ def FED3_post_processing():
         .grid(row=len(available_tabs)+1, column=0)
 
     root.wait_window(tab_window)
+
+    if not selected_tabs:
+        messagebox.showerror(
+            "Selection Error",
+            "No event tabs selected."
+        )
+        root.destroy()
+        return
 
     # ------------------------------------------------------------
     # ASK USER IF PLOTS SHOULD DISPLAY
@@ -1060,6 +1077,14 @@ def FED3_post_processing():
     # EXPORT COMBINED EXCEL
     # ------------------------------------------------------------
     output_path = os.path.join(save_folder, "FED3_FP_Combined.xlsx")
+
+    if all(len(combined_raw[tab]) == 0 for tab in selected_tabs):
+        messagebox.showerror(
+            "No Data",
+            "No valid data was extracted.\nExcel file will not be created."
+        )
+        root.destroy()
+        return
 
     with pd.ExcelWriter(output_path) as writer:
 
