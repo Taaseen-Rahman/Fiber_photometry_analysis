@@ -7,6 +7,309 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser
 import os
 import sys
+from copy import copy
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch, Rectangle
+import re
+import textwrap
+
+CHRONO_COLORS = {'Left': '#0072B2', 'Right': '#E69F00',
+                 'Pellet': '#009E73', 'Rewarded': '#CC79A7'}
+
+
+# ------------------------------------------------------------
+# READ CHRONOLOGICAL EVENT DATA
+# ------------------------------------------------------------
+def _chrono_read_frame(df, selected):
+    """Read original FED3 export headers, preserving event-to-trace correspondence."""
+    def header(label):
+        matches = df.index[df.eq(label).any(axis=1)].tolist()
+        if len(matches) != 1:
+            raise ValueError('Expected one header row: ' + label)
+        return matches[0]
+
+    onset_row = header('Time of event onset (secs)')
+    note_row = header('Event note')
+    start = header('Custom name') + 1
+    times = pd.to_numeric(df.iloc[start:, 1], errors='coerce').to_numpy(dtype=float)
+    keep = np.isfinite(times)
+    times = times[keep]
+    if len(times) < 2 or np.any(np.diff(times) <= 0):
+        raise ValueError('Peri-event time vector must contain increasing numeric timestamps.')
+    events = []
+    for col in range(3, df.shape[1]):
+        note = str(df.iloc[note_row, col]).strip()
+        if note not in selected:
+            continue
+        onset = pd.to_numeric(df.iloc[onset_row, col], errors='coerce')
+        if not np.isfinite(onset):
+            raise ValueError('Missing onset for event column %s; sequence cannot be reconstructed.' % col)
+        trace = pd.to_numeric(df.iloc[start:, col], errors='coerce').to_numpy(dtype=float)[keep]
+        events.append({'onset': float(onset), 'event': note, 'time': times,
+                       'trace': trace, 'source_column': col + 1})
+    return events
+
+
+def _chrono_load(path, selected):
+    with pd.ExcelFile(path) as book:
+        # Overall is authoritative and avoids counting the per-event sheets twice.
+        sheets = ['Overall'] if 'Overall' in book.sheet_names else [
+            event for event in selected if event in book.sheet_names]
+        if not sheets:
+            raise ValueError('No Overall or selected event sheets found.')
+        missing = [event for event in selected if event not in book.sheet_names]
+        if 'Overall' not in book.sheet_names and missing:
+            raise ValueError('Missing selected sheets: ' + ', '.join(missing))
+        events = []
+        for sheet in sheets:
+            for event in _chrono_read_frame(pd.read_excel(book, sheet_name=sheet, header=None), selected):
+                event['source_sheet'] = sheet
+                events.append(event)
+    events.sort(key=lambda event: event['onset'])
+    if not events:
+        raise ValueError('No selected events found.')
+    return events
+
+
+# ------------------------------------------------------------
+# CHRONOLOGICAL PLOT EXPORT HELPERS
+# ------------------------------------------------------------
+def _chrono_png_dpi(width, height):
+    """Bound wide PNG memory and dimensions while targeting 300 DPI."""
+    return min(300., 60000. / max(width, height), (40000000. / (width * height)) ** .5)
+
+
+def _chrono_export(records, folder, colors, sequence=True, heatmaps=True, page_events=400,
+                   show_plots=False, metadata_headers=('Mouse ID', 'Sex', 'Genotype'), trace_page_events=30, wide_png=True, wide_svg=True, paginated_png=False,
+                   metadata_color_maps=None):
+    """Export concatenated peri-event traces, heatmaps and an auditable event table."""
+    os.makedirs(folder, exist_ok=True)
+    def finish(figure, filename, wide=False):
+        output_path = os.path.join(folder, filename)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        try:
+            # Keep all line samples in the zoomable file; chunk raster paths for large exports.
+            with plt.rc_context({'path.simplify': False, 'agg.path.chunksize': 10000}):
+                if wide:
+                    stem = os.path.splitext(output_path)[0]
+                    if wide_svg:
+                        figure.savefig(stem + '.svg', format='svg')
+                    if wide_png:
+                        width, height = figure.get_size_inches()
+                        figure.savefig(stem + '.png', dpi=_chrono_png_dpi(width, height))
+                else:
+                    figure.savefig(output_path, dpi=300)
+            if show_plots:
+                # Display a screen-sized preview; exports keep their full dimensions.
+                if wide:
+                    figure.set_size_inches(18, min(12, figure.get_size_inches()[1]))
+                plt.show()
+        finally:
+            plt.close(figure)
+
+    # ------------------------------------------------------------
+    # EXPORT CHRONOLOGICAL EVENT AUDIT TABLE
+    # ------------------------------------------------------------
+    legend = [Patch(facecolor=color, label=event) for event, color in colors.items()]
+    rows = []
+    for record in records:
+        groups = []
+        for event in record['events']:
+            if not groups or event['onset'] != groups[-1][0]['onset']:
+                groups.append([])
+            groups[-1].append(event)
+        record['groups'] = groups
+        event_row = 0
+        for position, group in enumerate(groups, 1):
+            for event in group:
+                event_row += 1
+                rows.append({'Filename': record['filename'], 'Mouse': record['mouse'],
+                             'Sex': record['sex'], 'Group': record['group'],
+                              'Chronological position': position, 'Event row': event_row,
+                             'Window start (secs)': event['time'][0],
+                             'Window end (secs)': event['time'][-1], 'Onset (secs)': event['onset'],
+                             'Event': event['event'], 'Events at same timestamp': len(group),
+                             'Source sheet': event['source_sheet'],
+                             'Source column (Excel 1-based)': event['source_column']})
+    pd.DataFrame(rows).to_csv(os.path.join(folder, 'Chronological_events.csv'), index=False)
+    # ------------------------------------------------------------
+    # CALCULATE SHARED CHRONOLOGICAL Z-SCORE SCALE
+    # ------------------------------------------------------------
+    # A single symmetric scale across all selected recordings; no percentile clipping.
+    limit = 0.
+    for record in records:
+        for event in record['events']:
+            finite = event['trace'][np.isfinite(event['trace'])]
+            if len(finite):
+                limit = max(limit, float(np.max(np.abs(finite))))
+    limit = limit or 1.
+    # ------------------------------------------------------------
+    # CREATE CHRONOLOGICAL EVENT TRACE PLOTS
+    # ------------------------------------------------------------
+    if sequence:
+        modes = []
+        if wide_png or wide_svg:
+            modes.append(True)
+        if paginated_png:
+            modes.append(False)
+        for wide in modes:
+            mice_per_figure = len(records) if wide else 8
+            for first_record in range(0, len(records), mice_per_figure):
+                batch = records[first_record:first_record + mice_per_figure]
+                longest = max(len(r['events']) for r in batch)
+                events_per_figure = longest if wide else trace_page_events
+                for first in range(0, longest, events_per_figure):
+                    last = min(first + events_per_figure, longest)
+                    # Metadata occupies aligned columns, rather than a concatenated tick label.
+                    width = max(18, 6 + .4 * longest) if wide else 18
+                    fig, (meta_ax, ax) = plt.subplots(
+                        1, 2, figsize=(width, max(4, len(batch) * 1.1 + 2.5)),
+                        gridspec_kw={'width_ratios': [5, width - 6], 'wspace': .5 / width}, sharey=True)
+                    meta_ax.set_xlim(0, 3)
+                    meta_ax.axis('off')
+                    for column, header in enumerate(metadata_headers):
+                        meta_ax.text((column + .05) / 3, 1.02,
+                                     textwrap.fill(str(header), 16),
+                                     transform=meta_ax.transAxes, ha='left', va='bottom',
+                                     fontsize=10, fontweight='bold')
+                    for row, record in enumerate(batch):
+                        if row % 2 == 0:
+                            meta_ax.axhspan(row - .5, row + .5, color='#f3f3f3', zorder=0)
+                            ax.axhspan(row - .5, row + .5, color='#f3f3f3', zorder=0)
+                        for column, record_key, map_key in ((1, 'sex', 'sex'), (2, 'group', 'genotype')):
+                            cell_color = (metadata_color_maps or {}).get(map_key, {}).get(record[record_key])
+                            if cell_color:
+                                # White underlay keeps the chosen tint identical on alternating rows.
+                                meta_ax.add_patch(Rectangle((column, row - .5), 1, 1,
+                                                           facecolor='white', edgecolor='none', zorder=.1))
+                                meta_ax.add_patch(Rectangle((column, row - .5), 1, 1,
+                                                           facecolor=cell_color, alpha=.12,
+                                                           edgecolor='none', zorder=.2))
+                        for column, key in enumerate(('mouse', 'sex', 'group')):
+                            meta_ax.text(column + .05, row, textwrap.fill(record[key], 16),
+                                         ha='left', va='center', fontsize=9)
+                        if row and record['group'] != batch[row - 1]['group']:
+                            for axis in (meta_ax, ax):
+                                axis.axhline(row - .5, color='#888888', linewidth=.8)
+                    for column in (1, 2):
+                        meta_ax.axvline(column, color='#dddddd', linewidth=.6)
+                    ticks, tick_labels = [], []
+                    for row, record in enumerate(batch):
+                        ax.axhline(row, color='#bbbbbb', linewidth=.5, zorder=0)
+                        previous = None
+                        for pos in range(first, min(last, len(record['events']))):
+                            event = record['events'][pos]
+                            # Keep every original sample and its relative spacing within its window.
+                            time = event['time']
+                            x = pos + .52 + .96 * (time - time[0]) / (time[-1] - time[0])
+                            values = np.where(np.isfinite(event['trace']), event['trace'], np.nan)
+                            y = row - .36 * values / limit
+                            if previous is not None and np.isfinite(previous[1]) and np.isfinite(y[0]):
+                                # Grey joins explicitly mark the splice between separate windows.
+                                ax.plot([previous[0], x[0]], [previous[1], y[0]],
+                                        color='#999999', linewidth=.6, linestyle=':', zorder=1)
+                            ax.plot(x, y, color=colors[event['event']], linewidth=.9, zorder=2)
+                            previous = (x[-1], y[-1])
+                        ticks.extend([row - .36, row, row + .36])
+                        tick_labels.extend(['%g' % limit, '0', '%g' % -limit])
+                    ax.set_xlim(first + .5, last + .5)
+                    ax.set_ylim(len(batch) - .5, -.5)
+                    ax.set_yticks(ticks)
+                    ax.set_yticklabels(tick_labels, fontsize=7)
+                    ax.yaxis.tick_right()
+                    ax.yaxis.set_label_position('right')
+                    ax.set_ylabel('Z-score (shared scale)', fontsize=9)
+                    tick_step = max(1, int(np.ceil((last - first) / 30)))
+                    ax.set_xticks(np.arange(first + 1, last + 1, 1 if wide else tick_step))
+                    ax.tick_params(axis='x', labelsize=8)
+                    ax.set_xlabel('Event number — concatenated peri-event windows (not session time)')
+                    ax.set_title('Chronological peri-event Z-score traces')
+                    ax.legend(handles=legend, loc='lower center', bbox_to_anchor=(.5, 1.04), ncol=4)
+                    fig.text(.5, .045, 'Grey dotted joins mark separate windows. Equal-onset events are adjacent; their internal order is arbitrary.',
+                             ha='center', fontsize=9)
+                    fig.subplots_adjust(left=.45 / width, right=1 - .9 / width,
+                                        bottom=.18, top=.80)
+                    suffix = ''
+                    if len(records) > mice_per_figure:
+                        suffix += '_Mice_%02d' % (first_record // mice_per_figure + 1)
+                    if longest > events_per_figure:
+                        suffix += '_Part_%02d' % (first // events_per_figure + 1)
+                    name = 'Event_Sequence_Traces_Wide' if wide else 'Event_Sequence_Traces'
+                    finish(fig, os.path.join('Sequence_traces', name + suffix + '.png'), wide=wide)
+    # ------------------------------------------------------------
+    # CREATE CHRONOLOGICAL Z-SCORE HEATMAPS
+    # ------------------------------------------------------------
+    if heatmaps:
+        event_names = list(colors)
+        for number, record in enumerate(records, 1):
+            events = record['events']
+            reference = events[0]['time']
+            if any(len(e['time']) != len(reference) or not np.allclose(e['time'], reference)
+                   for e in events):
+                raise ValueError('Peri-event time vectors differ within ' + record['filename'])
+            edges = np.concatenate(([reference[0] - (reference[1] - reference[0]) / 2],
+                                    (reference[:-1] + reference[1:]) / 2,
+                                    [reference[-1] + (reference[-1] - reference[-2]) / 2]))
+            for first in range(0, len(events), page_events):
+                part = events[first:first + page_events]
+                fig, (strip, ax) = plt.subplots(1, 2, figsize=(11, 8),
+                                               gridspec_kw={'width_ratios': [1, 24]}, sharey=True)
+                yedges = np.arange(first + .5, first + len(part) + 1.5)
+                matrix = np.ma.masked_invalid(np.vstack([e['trace'] for e in part]))
+                cmap = copy(plt.get_cmap('RdBu_r'))
+                cmap.set_bad('#dddddd')
+                mesh = ax.pcolormesh(edges, yedges, matrix, cmap=cmap, vmin=-limit, vmax=limit,
+                                     shading='flat', rasterized=True)
+                strip.pcolormesh([0, 1], yedges,
+                                 np.array([event_names.index(e['event']) for e in part])[:, None],
+                                 cmap=ListedColormap(list(colors.values())), vmin=-.5,
+                                 vmax=len(colors) - .5, shading='flat')
+                strip.set_xticks([])
+                strip.set_ylabel('Retained event row (chronological; timestamp ties have no internal order)')
+                ax.set_ylim(yedges[-1], yedges[0])
+                if reference[0] <= 0 <= reference[-1]:
+                    ax.axvline(0, color='black', linewidth=.8, linestyle='--')
+                ax.set_xlabel('Time relative to event onset (seconds)')
+                fig.colorbar(mesh, ax=ax, label='Z-score (shared scale)')
+                fig.suptitle('%s | %s | %s\n%s' % (record['mouse'], record['sex'],
+                                                  record['group'], record['filename']), fontsize=10)
+                fig.legend(handles=legend, loc='lower center', ncol=4)
+                fig.tight_layout(rect=[0, .05, 1, .94])
+                safe = re.sub(r'[^\w-]', '_', record['mouse']) or 'Unknown'
+                # Include the recording name only when a mouse has multiple selected files.
+                same_mouse = [r for r in records if
+                              (re.sub(r'[^\w-]', '_', r['mouse']) or 'Unknown') == safe]
+                if len(same_mouse) > 1:
+                    safe += '_' + re.sub(r'[^\w-]', '_', os.path.splitext(record['filename'])[0])
+                suffix = '_Part_%02d' % (first // page_events + 1) if len(events) > page_events else ''
+                finish(fig, os.path.join('Individual_heatmaps', safe + '_Chronological_Heatmap' + suffix + '.png'))
+
+# ------------------------------------------------------------
+# BUILD CHRONOLOGICAL RECORDS FROM METADATA
+# ------------------------------------------------------------
+def _chrono_records(metadata, file_map, selected, mouse_col, sex_col, group_col):
+    """Load chronology only when selected in the regular plot-options window."""
+    records, errors = [], []
+    def clean(value):
+        return 'Unknown' if pd.isna(value) or not str(value).strip() else str(value).strip()
+    for _, row in metadata.iterrows():
+        filename = row['Filename']
+        if filename not in file_map:
+            continue
+        try:
+            records.append({'filename': filename, 'mouse': clean(row[mouse_col]),
+                            'sex': clean(row[sex_col]), 'group': clean(row[group_col]),
+                            'events': _chrono_load(file_map[filename], selected)})
+        except Exception as error:
+            errors.append('%s: %s' % (filename, error))
+    missing = set(file_map) - set(metadata['Filename'])
+    errors.extend('No metadata for selected file: ' + name for name in sorted(missing))
+    if metadata['Filename'].duplicated().any():
+        errors.append('Duplicate filenames in metadata; use one row per recording.')
+    if errors or not records:
+        raise ValueError('\n'.join(errors) or 'No recordings found.')
+    return records
+
 
 def FED3_post_processing():
 
@@ -26,6 +329,11 @@ def FED3_post_processing():
         return
 
     file_map = {os.path.basename(f): f for f in file_paths}
+    if len(file_map) != len(file_paths):
+        messagebox.showerror('Duplicate filenames',
+                             'Selected files must have unique filenames so metadata can identify each recording.')
+        root.destroy()
+        return
     save_folder = os.path.dirname(file_paths[0])
 
     # ------------------------------------------------------------
@@ -222,16 +530,18 @@ def FED3_post_processing():
         return
 
     # ------------------------------------------------------------
-    # PLOT AND EVENT-PROGRESSION OPTIONS
+    # PLOT, EVENT-PROGRESSION, AND CHRONOLOGICAL OPTIONS
     # ------------------------------------------------------------
     plot_options_window = tk.Toplevel(root)
-    plot_options_window.title("Event-Progression Plot Options")
+    plot_options_window.title("Event-Progression and Chronological Plot Options")
 
     checkbox_variables = {}
     checkbox_options = [
         "Create individual 2D event-progression plots",
         "Create individual 3D event-progression plots",
-        "Create group 3D comparison plots (shared axes)"
+        "Create group 3D comparison plots (shared axes)",
+        "Create chronological event trace plots",
+        "Create chronological Z-score heatmaps"
     ]
 
     for row_number, label in enumerate(checkbox_options):
@@ -262,7 +572,7 @@ def FED3_post_processing():
 
     for row_number, (label, default_value) in enumerate(
         general_option_defaults,
-        start=3
+        start=5
     ):
         tk.Label(plot_options_window, text=label).grid(
             row=row_number, column=0, sticky="e", padx=8, pady=4
@@ -277,26 +587,26 @@ def FED3_post_processing():
         value="Use full available range"
     )
     tk.Label(plot_options_window, text="3D time range").grid(
-        row=6, column=0, sticky="e", padx=8, pady=4
+        row=8, column=0, sticky="e", padx=8, pady=4
     )
     tk.OptionMenu(
         plot_options_window,
         time_range_mode,
         "Use full available range",
         "Custom range"
-    ).grid(row=6, column=1, sticky="w", padx=8, pady=4)
+    ).grid(row=8, column=1, sticky="w", padx=8, pady=4)
 
     tk.Label(plot_options_window, text="3D start time (s)").grid(
-        row=7, column=0, sticky="e", padx=8, pady=4
+        row=9, column=0, sticky="e", padx=8, pady=4
     )
     custom_start_entry = tk.Entry(plot_options_window, width=10, state="disabled")
-    custom_start_entry.grid(row=7, column=1, sticky="w", padx=8, pady=4)
+    custom_start_entry.grid(row=9, column=1, sticky="w", padx=8, pady=4)
 
     tk.Label(plot_options_window, text="3D end time (s)").grid(
-        row=8, column=0, sticky="e", padx=8, pady=4
+        row=10, column=0, sticky="e", padx=8, pady=4
     )
     custom_end_entry = tk.Entry(plot_options_window, width=10, state="disabled")
-    custom_end_entry.grid(row=8, column=1, sticky="w", padx=8, pady=4)
+    custom_end_entry.grid(row=10, column=1, sticky="w", padx=8, pady=4)
 
     viewing_option_defaults = [
         ("Vertical viewing angle", "25"),
@@ -304,7 +614,7 @@ def FED3_post_processing():
     ]
     for row_number, (label, default_value) in enumerate(
         viewing_option_defaults,
-        start=9
+        start=11
     ):
         tk.Label(plot_options_window, text=label).grid(
             row=row_number, column=0, sticky="e", padx=8, pady=4
@@ -356,7 +666,23 @@ def FED3_post_processing():
                 )
                 return
 
+            if (checkbox_variables["Create chronological event trace plots"].get() and
+                    not any(variable.get() for variable in trace_format_vars.values())):
+                messagebox.showerror("Error", "Select at least one chronological trace output format.")
+                return
+            trace_page_events = int(trace_page_entry.get())
+            if trace_page_events < 1:
+                messagebox.showerror("Error", "Events per trace page must be at least 1.")
+                return
             progression_options.update({
+                "trace_page_events": trace_page_events,
+                "trace_wide_png": trace_format_vars["wide_png"].get(),
+                "trace_wide_svg": trace_format_vars["wide_svg"].get(),
+                "trace_paginated_png": trace_format_vars["paginated_png"].get(),
+                "chronological_sequence": checkbox_variables[
+                    "Create chronological event trace plots"].get(),
+                "chronological_heatmaps": checkbox_variables[
+                    "Create chronological Z-score heatmaps"].get(),
                 "individual_2d": (
                     checkbox_variables[
                         "Create individual 2D event-progression plots"
@@ -386,11 +712,64 @@ def FED3_post_processing():
         except ValueError:
             messagebox.showerror("Error", "Please enter valid numeric plot settings")
 
+    # ------------------------------------------------------------
+    # CHRONOLOGICAL PLOT FORMAT AND COLOUR OPTIONS
+    # ------------------------------------------------------------
+    chronological_colors = dict(CHRONO_COLORS)
+    event_color_frame = tk.LabelFrame(plot_options_window, text="Chronological event colours")
+    event_color_frame.grid(row=13, column=0, columnspan=2, sticky="ew", padx=10, pady=6)
+    event_color_buttons = []
+    for column, event in enumerate(CHRONO_COLORS):
+        button = tk.Button(event_color_frame, text=event, bg=chronological_colors[event], width=10)
+        def choose_event_color(name=event, widget=button):
+            color = colorchooser.askcolor(chronological_colors[name],
+                                         title="Choose colour for " + name,
+                                         parent=plot_options_window)[1]
+            if color:
+                chronological_colors[name] = color
+                widget.configure(bg=color)
+        button.configure(command=choose_event_color)
+        button.grid(row=0, column=column, padx=4, pady=5)
+        event_color_buttons.append(button)
+
+    trace_format_vars = {}
+    trace_format_buttons = []
+    for row, (key, label, default) in enumerate([
+            ("wide_png", "Wide PNG — all mice and events", True),
+            ("wide_svg", "Zoomable SVG — all mice and events", True),
+            ("paginated_png", "Paginated PNGs", False)], start=2):
+        variable = tk.BooleanVar(master=plot_options_window, value=default)
+        trace_format_vars[key] = variable
+        button = tk.Checkbutton(event_color_frame, text=label, variable=variable)
+        button.grid(row=row, column=0, columnspan=4, sticky="w", padx=4)
+        trace_format_buttons.append(button)
+
+    tk.Label(event_color_frame, text="Events per PNG page").grid(
+        row=1, column=0, columnspan=2, sticky="e", padx=4, pady=4)
+    trace_page_entry = tk.Entry(event_color_frame, width=8)
+    trace_page_entry.insert(0, "30")
+    trace_page_entry.grid(row=1, column=2, sticky="w", padx=4, pady=4)
+
+    def update_event_color_controls(*_):
+        enabled = (checkbox_variables["Create chronological event trace plots"].get() or
+                   checkbox_variables["Create chronological Z-score heatmaps"].get())
+        traces_enabled = checkbox_variables["Create chronological event trace plots"].get()
+        for button in trace_format_buttons:
+            button.configure(state="normal" if traces_enabled else "disabled")
+        trace_page_entry.configure(state="normal" if traces_enabled and
+                                   trace_format_vars["paginated_png"].get() else "disabled")
+        for button in event_color_buttons:
+            button.configure(state="normal" if enabled else "disabled")
+    for label in ("Create chronological event trace plots", "Create chronological Z-score heatmaps"):
+        checkbox_variables[label].trace_add("write", update_event_color_controls)
+    trace_format_vars["paginated_png"].trace_add("write", update_event_color_controls)
+    update_event_color_controls()
+
     tk.Button(
         plot_options_window,
         text="Confirm",
         command=confirm_plot_options
-    ).grid(row=11, column=0, columnspan=2, pady=10)
+    ).grid(row=14, column=0, columnspan=2, pady=10)
 
     root.wait_window(plot_options_window)
 
@@ -625,6 +1004,18 @@ def FED3_post_processing():
         axis.yaxis.pane.fill = False
         axis.zaxis.pane.fill = False
 
+    def checked_plot_path(destination, filename):
+        """Return a save path and give a useful error before Windows/Pillow fails."""
+        output_file = os.path.abspath(os.path.join(destination, filename))
+        if os.name == "nt" and len(output_file) >= 260:
+            raise OSError(
+                "The plot output path is too long for this Windows/Python "
+                f"environment ({len(output_file)} characters):\n{output_file}\n\n"
+                "Choose or move the input data to a shorter parent folder. "
+                "The filename was not silently truncated."
+            )
+        return output_file
+
     def finish_plot(tab, plot_folder, filename):
         destination = os.path.join(
             save_folder,
@@ -633,10 +1024,7 @@ def FED3_post_processing():
             safe_filename_value(plot_folder)
         )
         os.makedirs(destination, exist_ok=True)
-        plt.savefig(
-            os.path.join(destination, filename),
-            dpi=300
-        )
+        plt.savefig(checked_plot_path(destination, filename), dpi=300)
 
         if show_plots:
             plt.show()
@@ -656,7 +1044,7 @@ def FED3_post_processing():
             *folder_parts
         )
         os.makedirs(destination, exist_ok=True)
-        output_file = os.path.join(destination, filename)
+        output_file = checked_plot_path(destination, filename)
         figure.savefig(output_file, dpi=300)
 
         if show_plots:
@@ -941,7 +1329,7 @@ def FED3_post_processing():
         finish_plot(
             tab,
             plot_folder,
-            f"FED3_FP_{tab}_Overlay{filename_suffix}.png"
+            f"{safe_filename_value(tab)}_Trace{filename_suffix}.png"
         )
 
     def pad_group_values(items):
@@ -991,6 +1379,12 @@ def FED3_post_processing():
         if len(data) == 0:
             return
 
+        # "Overlay" is already apparent from the figure and its title. Removing
+        # this fixed suffix keeps filenames descriptive without duplicating it.
+        compact_filename_base = str(filename_base)
+        if compact_filename_base.endswith("_Overlay"):
+            compact_filename_base = compact_filename_base[:-len("_Overlay")]
+
         groups = grouped_items(data, group_mode)
         if len(groups) == 0:
             return
@@ -1035,7 +1429,11 @@ def FED3_post_processing():
         finish_plot(
             tab,
             plot_folder,
-            f"FED3_FP_{tab}_{filename_base}{filename_suffix}.png"
+            (
+                f"{safe_filename_value(tab)}_"
+                f"{compact_filename_base}"
+                f"{filename_suffix}.png"
+            )
         )
 
     def plot_grouping_set(trace_data, metric_specs, tab, group_mode, group_label, filename_suffix, plot_folder, title_suffix=None):
@@ -1321,7 +1719,7 @@ def FED3_post_processing():
             figure,
             tab,
             "Group_3D_Comparisons",
-            f"FED3_FP_{safe_filename_value(tab)}_Group3D{filename_suffix}.png"
+            f"{safe_filename_value(tab)}_Group3D{filename_suffix}.png"
         )
 
     def plot_available_group_3d(trace_data, tab):
@@ -1419,6 +1817,32 @@ def FED3_post_processing():
     combined_meanz = {tab: [] for tab in selected_tabs}
 
     reference_time = None
+
+    # ------------------------------------------------------------
+    # OPTIONAL CHRONOLOGICAL PLOTS (same display preference as all other plots)
+    # ------------------------------------------------------------
+    if progression_options["chronological_sequence"] or progression_options["chronological_heatmaps"]:
+        try:
+            chronological_records = _chrono_records(
+                metadata_df, file_map, selected_tabs, mouse_id_col, sex_col, group_column)
+            chronological_folder = os.path.join(
+                save_folder, "Plots", "Chronological_event_plots")
+            _chrono_export(
+                chronological_records, chronological_folder,
+                {event: color for event, color in chronological_colors.items() if event in selected_tabs},
+                sequence=progression_options["chronological_sequence"],
+                heatmaps=progression_options["chronological_heatmaps"],
+                show_plots=show_plots,
+                metadata_headers=(mouse_id_col, sex_col, group_column),
+                metadata_color_maps=plot_color_maps,
+                trace_page_events=progression_options["trace_page_events"],
+                wide_png=progression_options["trace_wide_png"],
+                wide_svg=progression_options["trace_wide_svg"],
+                paginated_png=progression_options["trace_paginated_png"])
+        except Exception as error:
+            messagebox.showerror("Chronological plot error", str(error))
+            root.destroy()
+            return
 
     # ------------------------------------------------------------
     # EXTRACTION
@@ -1593,7 +2017,7 @@ def FED3_post_processing():
         finish_plot(
             tab,
             "Per_Mouse",
-            f"FED3_FP_{tab}_PerMouse.png"
+            f"{safe_filename_value(tab)}_PerMouse.png"
         )
 
         if (
@@ -1725,6 +2149,12 @@ def FED3_post_processing():
         ]
 
         progression_parameter_labels = [
+            ("Chronological wide PNG", "Yes" if progression_options["trace_wide_png"] else "No"),
+            ("Chronological zoomable SVG", "Yes" if progression_options["trace_wide_svg"] else "No"),
+            ("Chronological paginated PNGs", "Yes" if progression_options["trace_paginated_png"] else "No"),
+            ("Events per chronological trace page", progression_options["trace_page_events"]),
+            ("Chronological event trace plots", "Yes" if progression_options["chronological_sequence"] else "No"),
+            ("Chronological Z-score heatmaps", "Yes" if progression_options["chronological_heatmaps"] else "No"),
             ("Display plots", "Yes" if show_plots else "No"),
             (
                 "Individual 2D event-progression plots",
@@ -1774,6 +2204,12 @@ def FED3_post_processing():
                     "End Time (s)": np.nan,
                     "Value": color
                 })
+
+        if progression_options["chronological_sequence"] or progression_options["chronological_heatmaps"]:
+            for event in selected_tabs:
+                parameter_rows.append({"Parameter": "Chronological colour - " + event,
+                                       "Start Time (s)": np.nan, "End Time (s)": np.nan,
+                                       "Value": chronological_colors[event]})
 
         parameters = pd.DataFrame(parameter_rows)
         parameters.to_excel(writer, sheet_name="Analysis Parameters", index=False)
@@ -2278,3 +2714,4 @@ def FED3_post_processing():
 
 if __name__ == "__main__":
     FED3_post_processing()
+
